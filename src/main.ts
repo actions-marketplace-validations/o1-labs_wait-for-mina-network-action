@@ -1,7 +1,8 @@
 import * as core from '@actions/core'
-import {HttpClient} from '@actions/http-client'
+import { HttpClient } from '@actions/http-client'
+import { wait } from './wait'
 
-interface GraphQLResponse {
+interface GraphQlResponse {
   data?: {
     syncStatus?: string
   }
@@ -10,89 +11,101 @@ interface GraphQLResponse {
   }[]
 }
 
+/**
+ * The main function for the action.
+ * @returns {Promise<void>} Resolves when the action is complete.
+ */
 export async function run(): Promise<void> {
   const startTime = performance.now()
   const minaDaemonGraphQlPort = core.getInput('mina-graphql-port')
   const maxAttempts = Number(core.getInput('max-attempts'))
   const pollingIntervalMs = Number(core.getInput('polling-interval-ms'))
-  const minaDaemonGraphQlEndpoint = `http://localhost:${minaDaemonGraphQlPort}/graphql`
-  const queryObject = {
+  const minaDaemonGraphQlUrlWithIp = `http://127.0.0.1:${minaDaemonGraphQlPort}/graphql`
+  const minaDaemonGraphQlUrlWithDn = `http://localhost:${minaDaemonGraphQlPort}/graphql`
+  const syncStatusGraphQlQuery = {
     query: '{ syncStatus }',
     variables: null,
     operationName: null
   }
-  let portCheckAttempt = 1
-  let networkSyncAttempt = 1
-  let networkIsSynced = false
+  let blockchainSyncAttempt = 1
+  let blockchainIsReady = false
 
-  core.info('\nAction input parameters:')
+  core.info('\n')
+  core.info('Action input parameters:')
   core.info(`mina-graphql-port: ${minaDaemonGraphQlPort}`)
   core.info(`max-attempts: ${maxAttempts}`)
-  core.info(`polling-interval-ms: ${pollingIntervalMs}\n`)
+  core.info(`polling-interval-ms: ${pollingIntervalMs}`)
+  core.info('\nWaiting for the blockchain network readiness.\n')
 
-  core.info('\nWaiting for the Mina Daemon GraphQL port to be available...')
-
-  // Wait for GraphQL port to be ready
-  while (portCheckAttempt <= maxAttempts) {
+  const checkEndpoint = async (url: string): Promise<boolean> => {
     try {
-      await new HttpClient('mina-network-action').get(minaDaemonGraphQlEndpoint)
-      break
-    } catch (error) {
-      if (portCheckAttempt === maxAttempts) {
-        core.setFailed(
-          '\nMaximum port check attempts reached. GraphQL port not available.'
-        )
-        return
+      const response = await new HttpClient('mina-network-action', undefined, {
+        allowRedirects: true,
+        ignoreSslError: true
+      }).postJson<GraphQlResponse>(url, syncStatusGraphQlQuery)
+      if (response.statusCode < 400) {
+        const result = response.result
+        if (result?.data?.syncStatus === 'SYNCED') {
+          return true
+        }
       }
-      await new Promise(resolve => setTimeout(resolve, pollingIntervalMs))
-      portCheckAttempt++
+    } catch (_) {
+      // Ignore the errors.
     }
+    return false
   }
 
-  core.info(
-    '\nMina Daemon GraphQL port is ready.\nWaiting for the network to sync...\n'
-  )
-
-  // Wait for the network to sync
-  while (networkSyncAttempt <= maxAttempts && !networkIsSynced) {
-    const response = await new HttpClient(
-      'mina-network-action'
-    ).postJson<GraphQLResponse>(minaDaemonGraphQlEndpoint, queryObject)
-    if (!response || !response.result || !response.result.data) {
-      core.info(
-        `Empty response received. Retrying in ${
-          pollingIntervalMs / 1000
-        } seconds...`
-      )
-      await new Promise(resolve => setTimeout(resolve, pollingIntervalMs))
-    } else if (response.result.data.syncStatus === 'SYNCED') {
-      networkIsSynced = true
-      core.info('Network is synced.')
-    } else {
-      core.info(
-        `Network is not synced. Retrying in ${
-          pollingIntervalMs / 1000
-        } seconds...`
-      )
-      await new Promise(resolve => setTimeout(resolve, pollingIntervalMs))
+  while (blockchainSyncAttempt <= maxAttempts && !blockchainIsReady) {
+    blockchainIsReady =
+      (await checkEndpoint(minaDaemonGraphQlUrlWithIp)) ||
+      (await checkEndpoint(minaDaemonGraphQlUrlWithDn))
+    if (!blockchainIsReady) {
+      logBlockchainIsNotReadyYet(pollingIntervalMs)
+      await wait(pollingIntervalMs)
+      blockchainSyncAttempt++
     }
-    networkSyncAttempt++
   }
-
-  if (!networkIsSynced) {
+  if (!blockchainIsReady) {
     core.setFailed(
-      '\nMaximum network sync attempts reached. Network is not synced.'
+      '\nMaximum network sync attempts reached. The blockchain network is not ready!'
     )
   } else {
-    core.info('\nNetwork is ready to use.')
+    core.info('\nBlockchain network is ready to use.')
   }
-
-  const runTime = (performance.now() - startTime) / 1000
-  core.info(`\nDone. Runtime: ${runTime} seconds.\n`)
+  const runTimeSeconds = Math.round((performance.now() - startTime) / 1000)
+  core.info(`Total wait time: ${secondsToHms(runTimeSeconds)}.\n`)
 }
 
-if (!process.env.JEST_WORKER_ID) {
-  run().catch(error =>
-    core.setFailed(error instanceof Error ? error.message : String(error))
+function logBlockchainIsNotReadyYet(pollingIntervalMs: number): void {
+  core.info(
+    `Blockchain network is not ready yet. Retrying in ${
+      pollingIntervalMs / 1000
+    } seconds.`
   )
+}
+
+/**
+ * Converts seconds to human readable time format (HH hours, MM minutes, SS seconds).
+ * @param {number | string} seconds - The number of seconds to convert.
+ * @returns {string} The human readable time format.
+ */
+export function secondsToHms(seconds: number | string): string {
+  seconds = Number(seconds)
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  const s = Math.floor((seconds % 3600) % 60)
+  let hDisplay = ''
+  if (h > 0) {
+    hDisplay = h + (h === 1 ? ' hour, ' : ' hours, ')
+  }
+  let mDisplay = ''
+  if (m > 0) {
+    mDisplay = m + (m === 1 ? ' minute, ' : ' minutes, ')
+  }
+  let sDisplay = ''
+  if (s > 0) {
+    sDisplay = s + (s === 1 ? ' second' : ' seconds')
+  }
+  const result = hDisplay + mDisplay + sDisplay
+  return result.endsWith(', ') ? result.slice(0, -2) : result
 }
